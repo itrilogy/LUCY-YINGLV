@@ -86,7 +86,7 @@ def norm01(x, pct=99.0):
 
 
 # ---------------------------------------------------------------------------
-def fit_grid(drums, mix, sr, duration):
+def fit_grid(drums, mix, sr, duration, bpm_range=None):
     """Constant-tempo grid: coarse tempo/phase search on spectral-flux onset
     envelopes, then phase refinement on kick attack times."""
     hop = 64
@@ -102,17 +102,35 @@ def fit_grid(drums, mix, sr, duration):
         ts = off + P * np.arange(int(duration / P) + 1)
         idx = np.round(ts * ofps).astype(int)
         idx = idx[(idx > 2) & (idx < len(o) - 2)]
-        return np.maximum.reduce([o[idx - 1], o[idx], o[idx + 1]]).mean()
+        if len(idx) == 0:
+            return 0.0
+        return float(np.maximum.reduce([o[idx - 1], o[idx], o[idx + 1]]).mean())
 
-    best = (0, None, None)
-    for bpm in np.arange(125.0, 138.0, 0.02):
+    if bpm_range is None:
+        if common.TRACK == "pdoom":
+            bpm_lo, bpm_hi = 125.0, 138.0
+        else:
+            est_tempo, _ = librosa.beat.beat_track(onset_envelope=o, sr=22050, hop_length=hop // 2)
+            est_val = float(np.ndim(est_tempo) and est_tempo[0] or est_tempo)
+            if est_val < 75.0:
+                est_val *= 2.0
+            elif est_val > 175.0:
+                est_val *= 0.5
+            bpm_lo = max(68.0, est_val - 12.0)
+            bpm_hi = min(180.0, est_val + 12.0)
+    else:
+        bpm_lo, bpm_hi = float(bpm_range[0]), float(bpm_range[1])
+
+    best = (-1.0, (bpm_lo + bpm_hi) * 0.5, 0.0)
+    step_coarse = 0.02 if (bpm_hi - bpm_lo) <= 15.0 else 0.1
+    for bpm in np.arange(bpm_lo, bpm_hi, step_coarse):
         P = 60 / bpm
-        for off in np.arange(0, P, 0.004):
+        for off in np.arange(0, P, max(0.004, P / 100.0)):
             s = score(P, off)
             if s > best[0]:
                 best = (s, bpm, off)
     _, bpm, off = best
-    for b2 in np.arange(bpm - 0.02, bpm + 0.02, 0.001):  # fine
+    for b2 in np.arange(bpm - step_coarse, bpm + step_coarse, 0.002):  # fine
         P = 60 / b2
         for o2 in np.arange(off - 0.01, off + 0.01, 0.001):
             s = score(P, o2)
@@ -122,10 +140,16 @@ def fit_grid(drums, mix, sr, duration):
     P = 60 / bpm
     # refine phase on kick attacks (steepest rise of low-band log energy)
     kick_t, _ = band_onsets(drums, sr, None, 120, win=0.012, min_gap=0.2, rel_db=12)
-    n = np.round((kick_t - off) / P)
-    res = kick_t - (off + n * P)
-    res = res[np.abs(res) < 0.06]
-    off = off + float(np.median(res))
+    if len(kick_t) > 0:
+        n = np.round((kick_t - off) / P)
+        res = kick_t - (off + n * P)
+        res = res[np.abs(res) < 0.06]
+        if len(res) > 0:
+            off = off + float(np.median(res))
+        else:
+            res = np.zeros(1)
+    else:
+        res = np.zeros(1)
     # first beat >= 0
     off = off - P * math.floor(off / P)
     return bpm, P, off, res
@@ -171,13 +195,17 @@ def drum_onsets(d, sr, grid_P, grid_off):
     # in +-2.5 s and within 25 dB of the song-wide level (rejects stem bleed).
     # Kick-only beats / hats have tails 12-30 dB lower.
     st, sdb = band_onsets(d, sr, 1500, 5000, win=0.010, min_gap=0.15, rel_db=10)
-    xb = sosfiltfilt(band_sos(500, 5000, sr), d)
-    e = np.sqrt(np.convolve(xb.astype(np.float64) ** 2, np.ones(441) / 441, mode="same"))
-    tail = np.array([20 * np.log10(e[int((t + 0.04) * sr):int((t + 0.12) * sr)].mean() + 1e-9) for t in st])
-    rel = np.array([tail[i] - tail[np.abs(st - st[i]) < 2.5].max() for i in range(len(st))])
-    thr = np.percentile(tail, 95) - 25
-    keep = (rel > -8) & (tail > thr)
-    st, sdb, stail = st[keep], sdb[keep], tail[keep]
+    if len(st) > 0:
+        xb = sosfiltfilt(band_sos(500, 5000, sr), d)
+        e = np.sqrt(np.convolve(xb.astype(np.float64) ** 2, np.ones(441) / 441, mode="same"))
+        tail = np.array([20 * np.log10(e[int((t + 0.04) * sr):max(int((t + 0.04) * sr) + 1, int((t + 0.12) * sr))].mean() + 1e-9) for t in st])
+        rel = np.array([tail[i] - tail[np.abs(st - st[i]) < 2.5].max() for i in range(len(st))])
+        thr = float(np.percentile(tail, 95) - 25)
+        keep = (rel > -8) & (tail > thr)
+        st, sdb, stail = st[keep], sdb[keep], tail[keep]
+    else:
+        stail = np.array([])
+        thr = -40.0
     # HAT: >7 kHz, short; drop those coinciding with snares (snare noise also
     # reaches 7k+)
     ht, hdb = band_onsets(d, sr, 7000, None, win=0.006, min_gap=0.06, rel_db=9)
@@ -200,7 +228,11 @@ def strength01(db_vals, lo_pct=5, hi_pct=95):
 def vocal_onsets(v, sr):
     """Vocal note onsets: log-mel spectral flux peaks (5 ms hop) plus pitch
     jumps > 0.8 semitone while voiced, restricted to active vocal frames."""
-    f = dict(np.load(common.WORK / "vocal_feats.npz"))
+    feats_path = common.WORK / "vocal_feats.npz"
+    if not feats_path.exists():
+        vt, vdb = band_onsets(v, sr, 200, 3800, win=0.015, min_gap=0.10, rel_db=8.0)
+        return [(float(t), float(s)) for t, s in zip(vt, strength01(vdb))]
+    f = dict(np.load(feats_path))
     hop = float(f["hop_s"])
     on = f["onset"]
     rms = f["rms_db"]
@@ -236,16 +268,47 @@ def vocal_onsets(v, sr):
     return [(float(t), float(min(1.0, max(0.1, s)))) for t, s in ts]
 
 
+def synthesize_stems_from_mix(mix, sr):
+    """Fallback stem approximation when Demucs stems are unavailable:
+    uses harmonic/percussive separation + frequency band splitting."""
+    y_harm, y_perc = librosa.effects.hpss(mix, margin=2.0)
+    bass = sosfiltfilt(band_sos(None, 180, sr), y_harm).astype(np.float32)
+    vocals = sosfiltfilt(band_sos(220, 4200, sr), y_harm).astype(np.float32)
+    other = (y_harm - bass - vocals * 0.5).astype(np.float32)
+    drums = y_perc.astype(np.float32)
+    return {"vocals": vocals, "drums": drums, "bass": bass, "other": other}
+
+
+def auto_sections(downbeats, duration):
+    """Generate structural sections aligned to downbeats for arbitrary tracks."""
+    if len(downbeats) < 4:
+        return [{"name": "main", "start": 0.0, "end": round(duration, 3)}]
+    n_bars = len(downbeats)
+    intro_bar = min(4, max(1, n_bars // 12))
+    outro_bar = max(intro_bar + 1, n_bars - max(2, n_bars // 10))
+    mid_bar = (intro_bar + outro_bar) // 2
+    raw = [
+        ("intro", 0.0, float(downbeats[intro_bar])),
+        ("verse1", float(downbeats[intro_bar]), float(downbeats[mid_bar])),
+        ("chorus1", float(downbeats[mid_bar]), float(downbeats[outro_bar])),
+        ("outro", float(downbeats[outro_bar]), float(duration)),
+    ]
+    return [{"name": name, "start": round(s, 3), "end": round(e, 3)} for name, s, e in raw if e > s + 1e-3]
+
+
 # ---------------------------------------------------------------------------
-def main(plots=False):
+def main(plots=False, bpm_range=None):
     mix, _ = common.load_mix(SR)
     duration = len(mix) / SR
-    stems = {n: common.load_stem(n, sr=SR)[0][: len(mix)] for n in ("vocals", "drums", "bass", "other")}
-    for n in stems:
-        if len(stems[n]) < len(mix):
-            stems[n] = np.pad(stems[n], (0, len(mix) - len(stems[n])))
+    if common.has_stems():
+        stems = {n: common.load_stem(n, sr=SR)[0][: len(mix)] for n in ("vocals", "drums", "bass", "other")}
+        for n in stems:
+            if len(stems[n]) < len(mix):
+                stems[n] = np.pad(stems[n], (0, len(mix) - len(stems[n])))
+    else:
+        stems = synthesize_stems_from_mix(mix, SR)
 
-    bpm, P, off, kick_res = fit_grid(stems["drums"], mix, SR, duration)
+    bpm, P, off, kick_res = fit_grid(stems["drums"], mix, SR, duration, bpm_range=bpm_range)
     print(f"tempo {bpm:.3f} BPM  period {P:.5f}s  first beat {off:.4f}s  kick residual sd {kick_res.std()*1000:.1f} ms")
     beats = off + P * np.arange(int((duration - off) / P) + 1)
     # bar phase: beat index 0 is a downbeat (see NOTES / qa/drums_pattern.png)
@@ -283,13 +346,25 @@ def main(plots=False):
     print("hat    8th-positions in bar:", pos_hist(ht))
 
     # sections -------------------------------------------------------------------
-    sections = []
-    for name, a, b in SECTION_BARS:
-        s = 0.0 if a is None else bar_t(a)
-        e = duration if b is None else bar_t(b)
-        sections.append(dict(name=name, start=round(s, 3), end=round(e, 3), bars=[a if a is not None else -1, b]))
-    for s in sections:
-        s.pop("bars")
+    if common.TRACK == "pdoom":
+        sections = []
+        for name, a, b in SECTION_BARS:
+            s = 0.0 if a is None else bar_t(a)
+            e = duration if b is None else bar_t(b)
+            sections.append(dict(name=name, start=round(s, 3), end=round(e, 3), bars=[a if a is not None else -1, b]))
+        for s in sections:
+            s.pop("bars")
+        notes_str = NOTES.format(
+            bpm=bpm, off=off, P=P, first_db=float(downbeats[0]),
+            b61=bar_t(61), b76=bar_t(76), b77=bar_t(77), b84=bar_t(84),
+            sn=len(st), kk=len(kt), hh=len(ht),
+        )
+    else:
+        sections = auto_sections(downbeats, duration)
+        notes_str = (
+            f"Track '{common.TRACK}' analyzed at {bpm:.3f} BPM (period {P:.5f} s), "
+            f"{len(beats)} beats, {len(downbeats)} downbeats, {len(kt)} kicks, {len(st)} snares, {len(ht)} hats."
+        )
 
     doc = dict(
         duration=round(duration, 3),
@@ -302,9 +377,7 @@ def main(plots=False):
         fps=FPS,
         **env,
         onsets=onsets,
-        notes=NOTES.format(bpm=bpm, off=off, P=P, first_db=float(downbeats[0]),
-                           b61=bar_t(61), b76=bar_t(76), b77=bar_t(77), b84=bar_t(84),
-                           sn=len(st), kk=len(kt), hh=len(ht)),
+        notes=notes_str,
     )
     (common.DATA / "audio.json").write_text(json.dumps(doc, separators=(",", ":")))
     print("wrote", common.DATA / "audio.json", f"{len(beats)} beats, {len(downbeats)} downbeats, "

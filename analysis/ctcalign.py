@@ -25,7 +25,7 @@ AIDX = {c: i for i, c in enumerate(ALPHA)}
 
 def _common_logp(model):
     em = np.load(common.WORK / f"emission_{model}.npy").astype(np.float64)
-    if len(em) < N_FRAMES:
+    if common.TRACK == "pdoom" and len(em) < N_FRAMES:
         em = np.concatenate([em, np.repeat(em[-1:], N_FRAMES - len(em), 0)])
     if model.startswith("mms"):
         labs = list(torchaudio.pipelines.MMS_FA.get_labels(star=None))
@@ -42,16 +42,34 @@ def _common_logp(model):
     return out
 
 
+def _pad_to_max(arrays):
+    max_len = max(len(a) for a in arrays)
+    padded = [
+        np.concatenate([a, np.repeat(a[-1:], max_len - len(a), 0)]) if len(a) < max_len else a
+        for a in arrays
+    ]
+    return padded
+
+
 def emissions(kind):
     """kind: '<model>[_<source>]' with model in mms|lv60k|fused, source in
     ''(demucs mono)|lead|vocL|vocR; or 'fused6' = mixture of both models on
     mono, left and right channels."""
     if kind == "fused6":
-        es = [_common_logp(m + s) for m in ("mms", "lv60k") for s in ("", "_vocL", "_vocR")]
+        es = []
+        for m in ("mms", "lv60k"):
+            for s in ("", "_vocL", "_vocR"):
+                p = common.WORK / f"emission_{m + s}.npy"
+                if p.exists():
+                    es.append(_common_logp(m + s))
+        if not es:
+            raise FileNotFoundError(f"No emission files found in {common.WORK}")
+        es = _pad_to_max(es)
         return np.logaddexp.reduce(np.stack(es), axis=0) - np.log(len(es))
     if kind.startswith("fused"):
         suf = kind[len("fused"):]
         a, b = _common_logp("mms" + suf), _common_logp("lv60k" + suf)
+        a, b = _pad_to_max([a, b])
         return np.logaddexp(a, b) - np.log(2)
     return _common_logp(kind)
 

@@ -267,13 +267,14 @@ def detect_extras(words, f):
         else:
             out.append([a * hop, b * hop])
     out = [x for x in out if x[1] - x[0] >= 0.5]
+    extra_desc = EXTRA_DESC if common.TRACK == "pdoom" else []
     ext = []
     for a, b in out:
-        desc = next((d for (t0, t1, d) in EXTRA_DESC if a < t1 and b > t0), None)
+        desc = next((d for (t0, t1, d) in extra_desc if a < t1 and b > t0), None)
         ext.append(dict(start=round(a, 2), end=round(b, 2),
                         desc=desc or "unlisted vocal (backing vocal / ad-lib / breath)"))
     # also list known extras that overlap lyric words (e.g. backing pads)
-    for (t0, t1, d) in EXTRA_DESC:
+    for (t0, t1, d) in extra_desc:
         if not any(e["desc"] == d for e in ext):
             ext.append(dict(start=t0, end=t1, desc=d))
     ext.sort(key=lambda e: e["start"])
@@ -286,7 +287,12 @@ def median_filter_1d(x, n):
 
 
 def whisper_words():
-    W = json.loads((common.WORK / "whisper_turbo_prompt.json").read_text())
+    wfile = common.WORK / "whisper_turbo_prompt.json"
+    if not wfile.exists():
+        wfile = common.WORK / "whisper_turbo.json"
+    if not wfile.exists():
+        return []
+    W = json.loads(wfile.read_text())
     return [(w["word"].strip(), w["start"], w["end"]) for s in W["segments"] for w in s.get("words", [])]
 
 
@@ -318,16 +324,17 @@ def map_whisper(words, ww):
     return words
 
 
-def confidence(words, alt):
+def confidence(words, alt, active_fix=None):
+    active_fix = active_fix or {}
     for i, w in enumerate(words):
         ds = [abs(a[i]["start"] - w["ctc_start"]) for k, a in alt.items() if k != "fused_lead"]
-        agree = np.mean([d <= 0.06 for d in ds])
+        agree = np.mean([d <= 0.06 for d in ds]) if ds else 0.75
         p = min(1.0, w["conf"] / 0.5)
         wh = w.get("whisper")
         wagree = 0.5 if wh is None else float(abs(wh[0] - w["start"]) <= 0.15)
         c = 0.35 + 0.3 * agree + 0.2 * p + 0.15 * wagree
         if w.get("manual"):
-            fx = FIX.get((w["li"], w["ti"]), {})
+            fx = active_fix.get((w["li"], w["ti"]), {})
             c = fx.get("conf", max(c, 0.8))
         w["conf_final"] = round(float(np.clip(c, 0, 1)), 2)
     return words
@@ -337,14 +344,20 @@ def main(plots=False):
     L = common.load_lyrics_src()
     toks = [t.split(" ") for _, _, t in L]
     E = emissions(PRIMARY)
-    sp, score, _, _ = align(E, toks, anchors=ANCHORS, line_windows=LINE_WINDOWS)
+    active_anchors = ANCHORS if common.TRACK == "pdoom" else {}
+    active_windows = LINE_WINDOWS if common.TRACK == "pdoom" else {}
+    active_fix = FIX if common.TRACK == "pdoom" else {}
+    sp, score, _, _ = align(E, toks, anchors=active_anchors, line_windows=active_windows)
     words = word_table(sp, toks)
     alt = {}
     for k in ALTS:
-        s2, _, _, _ = align(emissions(k), toks, anchors=ANCHORS, line_windows=LINE_WINDOWS)
-        alt[k] = word_table(s2, toks)
+        try:
+            s2, _, _, _ = align(emissions(k), toks, anchors=active_anchors, line_windows=active_windows)
+            alt[k] = word_table(s2, toks)
+        except FileNotFoundError:
+            continue
     f = load_feats()
-    words = refine(words, f, FIX)
+    words = refine(words, f, active_fix)
     # enforce monotonic / non-overlap
     for k in range(1, len(words)):
         if words[k]["start"] < words[k - 1]["start"] + 0.02:
@@ -352,7 +365,7 @@ def main(plots=False):
         if words[k - 1]["end"] > words[k]["start"]:
             words[k - 1]["end"] = words[k]["start"]
     words = map_whisper(words, whisper_words())
-    words = confidence(words, alt)
+    words = confidence(words, alt, active_fix)
     (common.WORK / "align_debug.json").write_text(json.dumps(dict(words=words, alt=alt), indent=1, default=float))
 
     lines = []
