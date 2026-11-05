@@ -1,0 +1,17 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 48" width="96" height="96" role="img" aria-label="应律 · YingLv（歌曲节拍与歌词时序动效 MTV 引擎）">
+  <defs>
+    <linearGradient id="st" x1="8" y1="0" x2="40" y2="0" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#00D2FF" stop-opacity="0.2"/>
+      <stop offset="0.5" stop-color="#00D2FF"/>
+      <stop offset="1" stop-color="#7CF0FF" stop-opacity="0.55"/>
+    </linearGradient>
+  </defs>
+  <rect width="48" height="48" rx="12" fill="#0D5E42"/>
+  <g fill="none" stroke="#F5F7FA" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" transform="translate(12 12)">
+    <rect x="4" y="4" width="16" height="9" rx="1.5"/>
+    <path d="M4 17v-2M8 19v-5M12 17v-2M16 20v-7M20 17v-2" stroke="#00D2FF"/>
+    <circle cx="16" cy="8.5" r="1.5" fill="#F1C40F" stroke="none"/>
+  </g>
+  <rect x="8" y="40" width="32" height="3" rx="1.5" fill="url(#st)"/>
+  <path d="M40.5 5L41.05 6.75L43 6.75L41.4 7.85L41.95 9.55L40.5 8.5L39.05 9.55L39.6 7.85L38 6.75L39.95 6.75Z" fill="#F1C40F"/>
+</svg>

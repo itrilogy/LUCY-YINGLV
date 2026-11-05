@@ -1,6 +1,7 @@
 .DS_Store
 node_modules/
 .vite/
+dist/
 
 # renders
 out/
@@ -12,3 +13,6 @@ analysis/__pycache__/
 analysis/stems/
 analysis/work/
 analysis/qa/
+
+# 实测截图资产（81 MB，本地知识库保留；如需公开可在 GitHub Releases 分发）
+素材/*.png
