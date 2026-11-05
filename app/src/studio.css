@@ -1,0 +1,98 @@
+/* =============================================================================
+   应律 · YingLv (BeatStream) — 预览顶栏与辅助样式
+   严格遵循《鹿溪设计范式 · LUXI Design System v1.1.1》(LUCY-DESIGN)
+   ========================================================================== */
+
+.studio-preview-top-banner {
+  position: fixed;
+  top: var(--space-4, 16px);
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 9999;
+  background: var(--gradient-glass, rgba(18, 26, 23, 0.86));
+  backdrop-filter: blur(16px) saturate(140%);
+  -webkit-backdrop-filter: blur(16px) saturate(140%);
+  border: 1px solid var(--border-strong, rgba(245, 247, 250, 0.26));
+  box-shadow: var(--shadow-glass, 0 8px 32px rgba(0, 0, 0, 0.45));
+  border-radius: var(--radius-pill, 999px);
+  padding: var(--space-2, 8px) var(--space-5, 20px);
+  display: flex;
+  align-items: center;
+  gap: var(--space-6, 24px);
+  color: var(--text-primary, #F3EEE6);
+  font-family: var(--font-sans-zh, -apple-system, BlinkMacSystemFont, "PingFang SC", sans-serif);
+}
+
+.studio-preview-top-banner .banner-left {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3, 12px);
+  font-size: var(--fs-small, 13px);
+}
+
+.studio-preview-top-banner .banner-brand-icon {
+  width: 24px;
+  height: 24px;
+  border-radius: 6px;
+  flex-shrink: 0;
+}
+
+.studio-preview-top-banner .badge.live {
+  background: rgba(13, 94, 66, 0.35);
+  border: 1px solid var(--color-primary, #14805C);
+  color: var(--text-ok, #4ADE80);
+  padding: 2px 10px;
+  border-radius: var(--radius-pill, 999px);
+  font-size: var(--fs-micro, 11px);
+  font-weight: 600;
+  letter-spacing: 0.04em;
+}
+
+.studio-preview-top-banner .meta {
+  color: var(--text-muted, rgba(243, 238, 230, 0.6));
+  font-size: var(--fs-caption, 12px);
+  font-family: var(--font-mono, monospace);
+}
+
+.studio-preview-top-banner .banner-right {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2, 8px);
+}
+
+.studio-preview-top-banner .banner-btn {
+  height: var(--h-xs, 28px);
+  background: rgba(245, 247, 250, 0.08);
+  border: 1px solid var(--border-line, rgba(245, 247, 250, 0.16));
+  color: var(--text-primary, #F3EEE6);
+  padding: 0 12px;
+  border-radius: var(--radius-pill, 999px);
+  font-size: var(--fs-caption, 12px);
+  font-weight: 500;
+  cursor: pointer;
+  text-decoration: none;
+  display: inline-flex;
+  align-items: center;
+  transition: all 160ms cubic-bezier(0.2, 0, 0, 1);
+}
+
+.studio-preview-top-banner .banner-btn:hover {
+  background: rgba(245, 247, 250, 0.16);
+  border-color: var(--luxi-cyan, #00D2FF);
+  text-decoration: none;
+}
+
+.studio-preview-top-banner .banner-btn.primary {
+  background: var(--luxi-green, #0D5E42);
+  border-color: #14805C;
+  color: #F5F7FA;
+  font-weight: 600;
+}
+
+.studio-preview-top-banner .banner-btn.primary:hover {
+  background: #14805C;
+}
+
+body.export .studio-preview-top-banner {
+  display: none !important;
+}
