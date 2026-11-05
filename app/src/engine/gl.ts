@@ -97,6 +97,9 @@ export class FSPass {
     if (clear) renderer.clear();
     renderer.render(this.scene, this.cam);
   }
+  dispose() {
+    this.mat.dispose();
+  }
 }
 
 export type BlendMode = 'normal' | 'add' | 'screen' | 'multiply' | 'max' | 'replace';
@@ -144,6 +147,12 @@ export class Compositor {
     p.u.premult!.value = o.premult ?? o.mode !== 'multiply';
     p.render(renderer, target);
   }
+  dispose() {
+    for (const p of this.passes.values()) {
+      p.dispose();
+    }
+    this.passes.clear();
+  }
 }
 
 /**
@@ -188,6 +197,8 @@ export class Layer2D {
   canvas: HTMLCanvasElement;
   ctx: CanvasRenderingContext2D;
   texture: THREE.CanvasTexture;
+  isDirty = true;
+
   /** `scale`: backing px per drawing px (default SCALE; pass 1 for a deliberately low-res layer, e.g. a soft glow). */
   constructor(public w = W, public h = H, scale = SCALE) {
     this.canvas = document.createElement('canvas');
@@ -209,8 +220,20 @@ export class Layer2D {
     c.shadowBlur = 0;
     if (color) { c.fillStyle = color; c.fillRect(0, 0, this.w, this.h); }
     else c.clearRect(0, 0, this.w, this.h);
+    this.isDirty = true;
   }
-  upload() { this.texture.needsUpdate = true; return this.texture; }
+  upload(force = false) {
+    if (this.isDirty || force) {
+      this.texture.needsUpdate = true;
+      this.isDirty = false;
+    }
+    return this.texture;
+  }
+  dispose() {
+    this.texture.dispose();
+    this.canvas.width = 0;
+    this.canvas.height = 0;
+  }
 }
 
 /** Clear a render target to a linear colour. */

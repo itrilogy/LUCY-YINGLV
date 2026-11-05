@@ -790,9 +790,21 @@ export default class Outro extends Scene {
     if (!o) return undefined;
     const au = this.ctx.audio;
     const beat = au.beatAt(tau), bar = au.barAt(tau);
+    const a = au.sample(tau);
+    const barPhase = bar - Math.floor(bar);
+    const downbeat = Math.exp(-Math.min(1, barPhase * 16) * 4);
+    const energy = Math.min(1, a.rms * 1.5 + a.low * 0.8 + a.high * 0.5);
+
     return o.render({
       t: tau, dt: 1 / 60, lt: tau, p: tau / Math.max(1e-3, this.openEnd), start: 0, end: this.openEnd, seeked: true, preroll: false,
-      beat, bar, beatPhase: beat - Math.floor(beat), barPhase: bar - Math.floor(bar), a: au.sample(tau), under: null, tin: 1, tout: 0,
+      beat, bar, beatPhase: beat - Math.floor(beat), barPhase, a, under: null, tin: 1, tout: 0,
+      downbeat,
+      kickImpulse: a.kick,
+      snareImpulse: a.snare,
+      hatImpulse: a.hat,
+      energy,
+      layerIndex: 0,
+      suppressLyrics: false,
     }, out) as Record<string, any> | undefined;
   }
 }

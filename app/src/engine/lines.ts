@@ -145,4 +145,9 @@ export class LineBatch {
     renderer.render(this.scene, camera ?? this.cam2D);
     for (const at of this.attrs) at.clearUpdateRanges();
   }
+
+  dispose() {
+    this.geo.dispose();
+    this.mat.dispose();
+  }
 }

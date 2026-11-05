@@ -421,7 +421,10 @@ export default class Fuse extends Scene {
     const wb = this.wBlues;
     const HZ = STRING.hz;
     this.simT0 = wb.start - 0.15;
-    const n = Math.ceil((this.tEnd + 0.2 - this.simT0) * HZ);
+    // A plate mounted on an earlier cut used to pass a negative span straight into Float32Array.
+    const span = this.tEnd + 0.2 - this.simT0;
+    const nRaw = Math.ceil(span * HZ);
+    const n = Number.isFinite(nRaw) ? Math.min(120000, Math.max(2, nRaw)) : 2;
     this.sim = new Float32Array(n); this.simV = new Float32Array(n);
     // fill short unvoiced gaps (< 70 ms) so a glide is not read as a release
     const raw: (number | null)[] = [];

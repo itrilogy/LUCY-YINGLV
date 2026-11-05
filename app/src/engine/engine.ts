@@ -3,12 +3,23 @@
 import * as THREE from 'three';
 import { AudioData } from './audio';
 import { Lyrics } from './lyrics';
-import { Compositor, FSPass, W, H, PW, PH, SCALE, SS_TAP, makeRT, clearRT } from './gl';
+import { Compositor, FSPass, W, H, PW, PH, SCALE, SS_TAP, makeRT, clearRT, type BlendMode } from './gl';
 import { DEFAULT_POST, Post, SHOULDER_GLSL, type PostParams } from './post';
 import { Hud, PDoom, type Caption } from './hud';
 import type { Frame, Scene, SceneClass, SceneCtx, PostOverrides } from './scene';
 import { loadFonts } from './type';
 import { loadStrokeFonts } from './stroke';
+import { parseTimelineDSL, type TimelineDSLItem } from './timeline-loader';
+import { errorCollector } from './error-collector';
+import { AdaptedPlate, runWithCanvasTextMuted } from './plate-adapt';
+import { plateCoversWindow } from './plate-window';
+
+export interface EngineInitOptions {
+  only?: (e: TimelineEntry) => boolean;
+  audioUrl?: string;
+  lyricsUrl?: string;
+  timelineDSL?: TimelineDSLItem[];
+}
 
 export interface TimelineEntry {
   id: string;
@@ -24,6 +35,16 @@ export interface TimelineEntry {
   params?: Record<string, any>;
   /** Cap on adaptive motion-blur sub-frames while this entry is on screen (for noise that converges slowly). */
   maxSamples?: number;
+  /** Layer blending configuration for orthogonal pass compositing. */
+  blend?: { mode?: BlendMode; opacity?: number };
+  /** Layer pass index (0: background, 1: imagery, 2: accent, 3: typography). */
+  layerIndex?: number;
+  /** Emotional color grade profile. */
+  colorGrade?: string;
+  /** When true, this layer must not draw lyrics. Exactly one layer of a stacked shot owns the line. */
+  suppressLyrics?: boolean;
+  /** Plugin id (`plate-fuse`, `terrain`). Film plates use it to decide whether the authored shot still fits. */
+  module?: string;
 }
 
 interface Loaded { entry: TimelineEntry; scene: Scene | null; error?: string; lastT: number }
@@ -49,6 +70,14 @@ function ternaryOffsets(steps: number) {
   return u;
 }
 
+export const COLOR_GRADE_PROFILES: Record<string, Partial<PostParams>> = {
+  'cold-industrial': { exposure: 0.95, bloom: 0.45, ca: 1.5, grain: 0.07, vignette: 0.45, halation: 0.1 },
+  'warning-crimson': { exposure: 1.15, bloom: 0.8, bloomRadius: 0.9, ca: 2.5, grain: 0.08, vignette: 0.55, halation: 0.6 },
+  'cyber-green': { exposure: 1.05, bloom: 0.75, bloomRadius: 0.8, ca: 1.8, grain: 0.09, vignette: 0.4, halation: 0.15 },
+  'void-monochrome': { exposure: 0.85, bloom: 0.35, ca: 0.6, grain: 0.12, vignette: 0.6, halation: 0.05 },
+  'noir-gold': { exposure: 1.1, bloom: 0.9, bloomRadius: 0.85, ca: 1.4, grain: 0.065, vignette: 0.5, halation: 0.45 },
+};
+
 export class Engine {
   renderer: THREE.WebGLRenderer;
   ctx!: SceneCtx;
@@ -60,6 +89,8 @@ export class Engine {
   loaded = new Map<string, Loaded>();
   private rts = [makeRT(), makeRT(), makeRT()];
   private mixRT = makeRT(W, H, { depthBuffer: false });
+  private mixB = makeRT(W, H, { depthBuffer: false });
+  private keyRT = makeRT(W, H, { depthBuffer: false });
   // motion-blur sub-frame sums (float: up to hundreds of sub-frames), their average, and the error estimate
   private sumRT = makeRT(W, H, { depthBuffer: false, type: THREE.FloatType });
   private newRT = makeRT(W, H, { depthBuffer: false, type: THREE.FloatType });
@@ -75,6 +106,8 @@ export class Engine {
   private finalRT = new THREE.WebGLRenderTarget(PW, PH, { type: THREE.UnsignedByteType, depthBuffer: false });
   private blit: FSPass;
   private xfade: FSPass;
+  private keyPass: FSPass;
+  private scrimPass: FSPass;
   private accum: FSPass;
   private lastT = -1;
   lastPost: PostParams = { ...DEFAULT_POST };
@@ -92,6 +125,29 @@ export class Engine {
     this.blit = new FSPass(`uniform sampler2D src; void main(){ fragColor = texture(src, vUv); }`, { src: { value: null } });
     this.xfade = new FSPass(`uniform sampler2D a; uniform sampler2D b; uniform float k;
       void main(){ fragColor = mix(texture(a, vUv), texture(b, vUv), k); }`, { a: { value: null }, b: { value: null }, k: { value: 0 } });
+    // Luma key: a full-frame plugin used as imagery/accent drops its near-black plate so the
+    // background pass remains visible. Output is premultiplied.
+    this.keyPass = new FSPass(`uniform sampler2D src;
+      void main() {
+        vec4 c = texture(src, vUv);
+        c.rgb = min(c.rgb, vec3(1.2));
+        float L = dot(c.rgb, vec3(0.2126, 0.7152, 0.0722));
+        float a = smoothstep(0.025, 0.20, L) * c.a;
+        fragColor = vec4(c.rgb * a, a);
+      }`, { src: { value: null } });
+    // Radial ink scrim over the text-safe rect before the typography pass.
+    this.scrimPass = new FSPass(`uniform sampler2D src;
+      void main() {
+        vec4 c = texture(src, vUv);
+        vec2 p = vUv - vec2(0.5);
+        // Safe rect: x in [0.20, 0.80], y in [0.35, 0.65]. Ink stays >= 0.80 inside it.
+        float r = max(abs(p.x) / 0.30, abs(p.y) / 0.15);
+        float inside = 1.0 - smoothstep(1.0, 1.55, r);
+        float ink = mix(0.92, 0.80, clamp(r, 0.0, 1.0));
+        c.rgb = mix(c.rgb, vec3(0.012, 0.010, 0.008), inside * ink);
+        c.rgb = min(c.rgb, vec3(1.4));
+        fragColor = c;
+      }`, { src: { value: null } });
     // adds a sub-frame to a sum; a non-finite pixel (a stray NaN from some shader in one sub-frame out of
     // hundreds) is dropped, or it would poison the average and bloom into a disc
     this.accum = new FSPass(`uniform sampler2D src;
@@ -138,9 +194,21 @@ export class Engine {
       }`, { e: { value: null } });
   }
 
-  async init(only?: (e: TimelineEntry) => boolean) {
-    [this.audio, this.lyrics] = await Promise.all([AudioData.load(), Lyrics.load(), loadFonts(), loadStrokeFonts()]) as [AudioData, Lyrics, void, void];
-    this.timeline = this.makeTimeline(this.lyrics, this.audio);
+  async init(opts?: ((e: TimelineEntry) => boolean) | EngineInitOptions) {
+    const options: EngineInitOptions = typeof opts === 'function' ? { only: opts } : (opts ?? {});
+    [this.audio, this.lyrics] = await Promise.all([
+      AudioData.load(options.audioUrl),
+      Lyrics.load(options.lyricsUrl),
+      loadFonts(),
+      loadStrokeFonts(),
+    ]) as [AudioData, Lyrics, void, void];
+
+    if (options.timelineDSL && options.timelineDSL.length > 0) {
+      this.timeline = parseTimelineDSL(options.timelineDSL, this.lyrics, this.audio);
+    } else {
+      this.timeline = this.makeTimeline(this.lyrics, this.audio);
+    }
+
     this.ctx = { renderer: this.renderer, audio: this.audio, lyrics: this.lyrics, comp: this.comp, W, H, id: '', params: {}, start: 0, end: 0 };
     this.post = new Post();
     const captions: Caption[] = this.timeline.filter((e) => e.caption).map((e) => {
@@ -148,22 +216,46 @@ export class Engine {
       return { start: e.start + d, end: e.start + d + (e.caption!.dur ?? 4.5), fig: e.caption!.fig, text: e.caption!.text };
     });
     this.hud = new Hud(new PDoom(this.lyrics), captions);
-    const entries = only ? this.timeline.filter(only) : this.timeline;
+    const filterFn = options.only;
+    const entries = filterFn ? this.timeline.filter(filterFn) : this.timeline;
     await Promise.all(entries.map((e) => this.loadEntry(e)));
   }
 
   private async loadEntry(e: TimelineEntry) {
     const rec: Loaded = { entry: e, scene: null, lastT: -1 };
     this.loaded.set(e.id, rec);
+    const ctx = { ...this.ctx, id: e.id, params: e.params ?? {}, start: e.start, end: e.end };
+    const moduleName = e.module ?? '';
+    const film = moduleName.startsWith('plate-');
+    let created: Scene | null = null;
     try {
+      // A film plate indexes its own lyric lines. On any other window that init throws
+      // (negative sample counts) or paints a single frozen sentence.
+      if (film && !plateCoversWindow(moduleName, this.lyrics, e.start, e.end)) {
+        created = new AdaptedPlate(ctx, moduleName);
+        await created.init();
+        rec.scene = created;
+        return;
+      }
       const mod = await e.load();
-      const s = new mod.default({ ...this.ctx, id: e.id, params: e.params ?? {}, start: e.start, end: e.end });
-      await s.init();
-      rec.scene = s;
+      created = new mod.default(ctx);
+      await created.init();
+      rec.scene = created;
     } catch (err) {
+      try { created?.dispose(); } catch { /* half-built plate */ }
+      created = null;
+      rec.scene = null;
       rec.error = String((err as Error)?.stack ?? err);
       this.errors.push(`[${e.id}] ${rec.error}`);
       console.error(`scene ${e.id} failed`, err);
+      if (!film) return;
+      try {
+        const fallback = new AdaptedPlate(ctx, moduleName);
+        await fallback.init();
+        rec.scene = fallback;
+      } catch (fallbackErr) {
+        console.error(`scene ${e.id} fallback failed`, fallbackErr);
+      }
     }
   }
 
@@ -176,14 +268,58 @@ export class Engine {
     this.lastT = -1;
   }
 
+  /** Dynamically re-parse and load timeline DSL, disposing old scenes and instantiating new ones. */
+  async updateTimelineDSL(dsl: TimelineDSLItem[]) {
+    for (const [_, rec] of this.loaded) {
+      try {
+        rec.scene?.dispose();
+      } catch (err: any) {
+        console.warn(`[Engine] Scene disposal error:`, err);
+      }
+    }
+    this.loaded.clear();
+    this.errors = [];
+
+    this.timeline = parseTimelineDSL(dsl, this.lyrics, this.audio);
+
+    const captions: Caption[] = this.timeline.filter((e) => e.caption).map((e) => {
+      const d = e.caption!.delay ?? 0.3;
+      return { start: e.start + d, end: e.start + d + (e.caption!.dur ?? 4.5), fig: e.caption!.fig, text: e.caption!.text };
+    });
+    this.hud = new Hud(new PDoom(this.lyrics), captions);
+
+    await Promise.all(this.timeline.map((e) => this.loadEntry(e)));
+    this.lastT = -1;
+  }
+
   get duration() { return this.audio.duration; }
+
+  getMemoryInfo() {
+    return {
+      geometries: this.renderer.info.memory.geometries,
+      textures: this.renderer.info.memory.textures,
+      calls: this.renderer.info.render.calls,
+      triangles: this.renderer.info.render.triangles,
+    };
+  }
 
   private frameFor(e: TimelineEntry, t: number, dt: number, seeked: boolean, preroll: boolean, under: THREE.Texture | null, tin: number, tout: number): Frame {
     const beat = this.audio.beatAt(t), bar = this.audio.barAt(t);
+    const a = this.audio.sample(t);
+    const barPhase = bar - Math.floor(bar);
+    const downbeat = Math.exp(-Math.min(1, barPhase * 16) * 4);
+    const energy = Math.min(1, a.rms * 1.5 + a.low * 0.8 + a.high * 0.5);
     return {
       t, dt, lt: t - e.start, p: (t - e.start) / (e.end - e.start), start: e.start, end: e.end, seeked, preroll,
-      beat, bar, beatPhase: beat - Math.floor(beat), barPhase: bar - Math.floor(bar),
-      a: this.audio.sample(t), under, tin, tout,
+      beat, bar, beatPhase: beat - Math.floor(beat), barPhase,
+      a, under, tin, tout,
+      downbeat,
+      kickImpulse: a.kick,
+      snareImpulse: a.snare,
+      hatImpulse: a.hat,
+      energy,
+      layerIndex: e.layerIndex ?? 0,
+      suppressLyrics: e.suppressLyrics ?? false,
     };
   }
 
@@ -303,15 +439,23 @@ export class Engine {
   private composite(t: number, dt: number, seeked: boolean): { outTex: THREE.Texture; post: PostParams } {
     const r = this.renderer;
 
-    const active = this.timeline.filter((e) => t >= e.start && t < e.end).sort((a, b) => a.start - b.start);
+    const active = this.timeline
+      .filter((e) => t >= e.start && t < e.end)
+      .sort((a, b) => a.start - b.start || (a.layerIndex ?? 0) - (b.layerIndex ?? 0));
     let post: PostParams = { ...DEFAULT_POST };
     let under: THREE.Texture | null = null;
     let outTex: THREE.Texture | null = null;
+    // One stacked shot: every active entry shares the window and carries a layer index.
+    const layeredShot = active.length > 1
+      && active.every((e) => e.layerIndex !== undefined && e.start === active[0]!.start && e.end === active[0]!.end);
+    let front: THREE.WebGLRenderTarget | null = null;
 
     active.forEach((e, idx) => {
       const rec = this.loaded.get(e.id);
       const rt = this.rts[idx % this.rts.length]!;
-      const prev = active[idx - 1], next = active[idx + 1];
+      // Sibling layers share one window, so they are not a crossfade. tin/tout describe shot overlap only.
+      const prev = layeredShot ? undefined : active[idx - 1];
+      const next = layeredShot ? undefined : active[idx + 1];
       const tin = prev ? Math.min(1, (t - e.start) / Math.max(1e-3, prev.end - e.start)) : 1;
       const tout = next ? Math.max(0, (t - next.start) / Math.max(1e-3, e.end - next.start)) : 0;
       if (!rec?.scene) {
@@ -333,24 +477,91 @@ export class Engine {
         }
       }
       let ov: PostOverrides | void = undefined;
-      try {
+      clearRT(r, rt, [0, 0, 0], 1);
+      const drawScene = () => {
         ov = s.render(this.frameFor(e, t, sceneSeeked ? 0 : dt, sceneSeeked && !s.stateful, false, idx > 0 ? under : null, tin, tout), rt);
-      } catch (err) {
-        console.error(`scene ${e.id} render error`, err);
+      };
+      try {
+        // Stacked shots already assigned the line to one layer. Film plates still paint
+        // their own captions unless canvas text is muted for this draw.
+        if (e.suppressLyrics && (e.module ?? '').startsWith('plate-')) runWithCanvasTextMuted(drawScene);
+        else drawScene();
+      } catch (err: any) {
+        const msg = `Scene ${e.id} render error at ${t.toFixed(2)}s: ${err.message ?? err}`;
+        console.error(msg, err);
+        this.errors.push(msg);
+        errorCollector.report({
+          source: 'scene',
+          severity: 'error',
+          context: e.id,
+          message: msg,
+          stack: err.stack,
+        });
         clearRT(r, rt, [0.25, 0.0, 0.0]);
       }
       rec.lastT = t;
-      post = { ...post, ...(e.post ?? {}), ...(ov ?? {}) };
-      if (idx > 0 && !s.handlesTransition && under) {
-        // default: crossfade from the previous scene over the overlap
-        this.xfade.u.a!.value = under;
-        this.xfade.u.b!.value = rt.texture;
-        this.xfade.u.k!.value = tin;
-        this.xfade.render(r, this.mixRT);
+      const gradeOverrides = e.colorGrade ? (COLOR_GRADE_PROFILES[e.colorGrade] ?? {}) : {};
+      post = { ...post, ...gradeOverrides, ...(e.post ?? {}), ...(ov ?? {}) };
+
+      if (layeredShot && under && front) {
+        const dest = front === this.mixRT ? this.mixB : this.mixRT;
+        const opacity = e.blend?.opacity ?? 1;
+        if ((e.layerIndex ?? 0) >= 3) {
+          this.scrimPass.u.src!.value = front.texture;
+          this.scrimPass.render(r, dest);
+          this.comp.draw(r, rt.texture, dest, { mode: 'normal', opacity, premult: true });
+        } else {
+          this.keyPass.u.src!.value = rt.texture;
+          this.keyPass.render(r, this.keyRT);
+          this.comp.draw(r, front.texture, dest, { mode: 'replace', premult: false });
+          const mode = e.blend?.mode ?? ((e.layerIndex ?? 0) === 2 ? 'screen' : 'normal');
+          this.comp.draw(r, this.keyRT.texture, dest, { mode, opacity, premult: false });
+        }
+        front = dest;
+        outTex = dest.texture;
+      } else if (layeredShot) {
+        this.comp.draw(r, rt.texture, this.mixRT, { mode: 'replace', premult: false });
+        front = this.mixRT;
         outTex = this.mixRT.texture;
-      } else outTex = rt.texture;
+      } else if (idx > 0 && under) {
+        const prevEntry = active[idx - 1]!;
+        // DSL shots abut. A one-frame overlap is still a hard cut. Original scenes keep the crossfade.
+        const dslHandoff = (e.layerIndex !== undefined || prevEntry.layerIndex !== undefined)
+          && e.start - prevEntry.end >= -1 / 60;
+        if (!s.handlesTransition && !dslHandoff) {
+          this.xfade.u.a!.value = under;
+          this.xfade.u.b!.value = rt.texture;
+          this.xfade.u.k!.value = tin;
+          this.xfade.render(r, this.mixRT);
+          outTex = this.mixRT.texture;
+        } else {
+          outTex = rt.texture;
+        }
+      } else {
+        outTex = rt.texture;
+      }
       under = outTex;
     });
+
+    if (layeredShot && active.some((e) => e.colorGrade)) {
+      const bar = this.audio.barAt(t);
+      const barPhase = bar - Math.floor(bar);
+      const downbeat = Math.exp(-Math.min(1, barPhase * 16) * 4);
+      post = { ...post, exposure: (post.exposure ?? 1) * (1 + 0.03 * downbeat) };
+    }
+
+    if (active.some((e) => e.layerIndex !== undefined)) {
+      const shot = [...active].reverse().find((e) => e.layerIndex !== undefined) ?? active[active.length - 1]!;
+      const shake = post.shake ?? [0, 0];
+      post = {
+        ...post,
+        flash: t - shot.start < 0.15 || shot.end - t < 0.20 ? 0 : post.flash,
+        shake: [Math.max(-4, Math.min(4, shake[0] ?? 0)), Math.max(-4, Math.min(4, shake[1] ?? 0))],
+        zoom: Math.min(1.05, post.zoom ?? 1),
+        bloom: Math.min(1, post.bloom ?? 0),
+        ca: Math.min(5, post.ca ?? 0),
+      };
+    }
 
     if (!outTex) { clearRT(r, this.rts[0]!, [0, 0, 0]); outTex = this.rts[0]!.texture; }
     return { outTex, post };
